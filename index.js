@@ -41,6 +41,14 @@ const UEEX_SUCCESS_STATUS = process.env.UEEX_SUCCESS_STATUS || "success";
 const PAYMENT_MATCH_MODE = process.env.PAYMENT_MATCH_MODE || "remark_or_uid_amount";
 // UID is now the primary payment confirmation key. When true, UID+exact amount can match even if the user left a non-order remark.
 const UID_AMOUNT_MATCH_ALLOW_REMARK = String(process.env.UID_AMOUNT_MATCH_ALLOW_REMARK || "true").toLowerCase() === "true";
+const ONE_HOUR_REMINDER_ENABLED = String(process.env.ONE_HOUR_REMINDER_ENABLED || "true").toLowerCase() === "true";
+const MATCH_REMINDER_CHECK_INTERVAL_MS = Number(process.env.MATCH_REMINDER_CHECK_INTERVAL_MS || 60000);
+const MATCH_REMINDER_MINUTES_BEFORE_KICKOFF = Number(process.env.MATCH_REMINDER_MINUTES_BEFORE_KICKOFF || 60);
+const MATCH_REMINDER_EARLIEST_MINUTES_BEFORE_KICKOFF = Number(process.env.MATCH_REMINDER_EARLIEST_MINUTES_BEFORE_KICKOFF || 70);
+const MATCH_REMINDER_LATEST_MINUTES_BEFORE_KICKOFF = Number(process.env.MATCH_REMINDER_LATEST_MINUTES_BEFORE_KICKOFF || 16);
+const MATCH_REMINDER_BATCH_SIZE = Number(process.env.MATCH_REMINDER_BATCH_SIZE || 1000);
+const MATCH_REMINDER_SEND_DELAY_MS = Number(process.env.MATCH_REMINDER_SEND_DELAY_MS || 120);
+const CRON_SECRET = process.env.CRON_SECRET || "";
 const UEEX_API_BASE_URL = (process.env.UEEX_API_BASE_URL || "").replace(/\/$/, "");
 const UEEX_API_KEY = process.env.UEEX_API_KEY || "";
 const UEEX_API_SECRET = process.env.UEEX_API_SECRET || "";
@@ -387,6 +395,73 @@ function getTelegramUserLabel(userLike) {
   if (userLike.id) return `TG ${userLike.id}`;
 
   return "Unknown TG";
+}
+
+function normalizeLangValue(lang) {
+  return String(lang || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+function getTelegramIdValue(userLike) {
+  const value = userLike?.id || userLike?.telegram_id || userLike?.from?.id || "";
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const num = Number(text);
+  return Number.isSafeInteger(num) ? num : text;
+}
+
+function getTelegramIdKey(userLike) {
+  const value = getTelegramIdValue(userLike);
+  return value === null ? "" : String(value);
+}
+
+async function upsertBotUser(ctxOrUser, lang = null) {
+  const user = ctxOrUser?.from || ctxOrUser;
+  const telegramId = getTelegramIdValue(user);
+
+  if (!telegramId || user?.is_bot) return null;
+
+  const now = new Date().toISOString();
+  const payload = {
+    telegram_id: telegramId,
+    username: user.username || null,
+    first_name: user.first_name || null,
+    last_name: user.last_name || null,
+    last_seen_at: now,
+    updated_at: now
+  };
+
+  if (lang) {
+    payload.preferred_lang = normalizeLangValue(lang);
+  }
+
+  try {
+    const { error } = await supabase
+      .from("wc_bot_users")
+      .upsert(payload, { onConflict: "telegram_id" });
+
+    if (error) {
+      console.error("Upsert bot user error:", error.message);
+      return null;
+    }
+  } catch (error) {
+    console.error("Upsert bot user exception:", error.message);
+    return null;
+  }
+
+  return payload;
+}
+
+async function saveUserLanguage(ctxOrUser, lang) {
+  const normalized = normalizeLangValue(lang);
+  const user = ctxOrUser?.from || ctxOrUser;
+  const telegramIdKey = getTelegramIdKey(user);
+
+  if (telegramIdKey) {
+    languageStore.set(telegramIdKey, normalized);
+  }
+
+  await upsertBotUser(ctxOrUser, normalized);
+  return normalized;
 }
 
 function formatSelectionWithFlags(match, selection, ctxOrLang = null) {
@@ -807,6 +882,7 @@ async function upsertUser(ctx, uid) {
     throw new Error(`Failed to save UID: ${error.message}`);
   }
 
+  await upsertBotUser(ctx, getUserLang(ctx));
   return data;
 }
 
@@ -974,7 +1050,7 @@ function setUserLang(ctxOrUserId, lang) {
       ? ctxOrUserId?.from?.id
       : ctxOrUserId;
 
-  const normalized = String(lang || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+  const normalized = normalizeLangValue(lang);
 
   if (userId) {
     languageStore.set(String(userId), normalized);
@@ -2708,6 +2784,315 @@ function startLiveMatchUpdater() {
   if (!LIVE_UPDATE_INTERVAL_MS || LIVE_UPDATE_INTERVAL_MS < 5000) return;
 
   setInterval(updateAllLiveOpenMatches, LIVE_UPDATE_INTERVAL_MS);
+}
+
+function getMatchKickoffAt(match) {
+  if (!match?.betting_end_at) return null;
+  const bettingEndMs = new Date(match.betting_end_at).getTime();
+  if (Number.isNaN(bettingEndMs)) return null;
+  return new Date(bettingEndMs + 15 * 60 * 1000);
+}
+
+function getMinutesToKickoff(match, now = new Date()) {
+  const kickoffAt = getMatchKickoffAt(match);
+  if (!kickoffAt) return null;
+  return (kickoffAt.getTime() - now.getTime()) / 60000;
+}
+
+function isMatchDueForOneHourReminder(match, now = new Date()) {
+  if (!ONE_HOUR_REMINDER_ENABLED) return false;
+  if (!match || match.status !== "open") return false;
+  if (!isVotingOpen(match)) return false;
+
+  const minutesToKickoff = getMinutesToKickoff(match, now);
+  if (minutesToKickoff === null) return false;
+
+  return (
+    minutesToKickoff <= MATCH_REMINDER_EARLIEST_MINUTES_BEFORE_KICKOFF &&
+    minutesToKickoff >= MATCH_REMINDER_LATEST_MINUTES_BEFORE_KICKOFF
+  );
+}
+
+function buildMatchReminderMessage(match, ctxOrLang = null) {
+  const minBet = getStageMinimumBetAmount(match);
+
+  if (isZh(ctxOrLang)) {
+    return `⏰ 比赛提醒
+
+${formatTeamWithFlag(match.team_a)} vs ${formatTeamWithFlag(match.team_b)} 将在约 1 小时后开赛。
+
+预测通道已开启，开赛前 15 分钟停止投票。
+最低投票金额：${formatAmount(minBet)} ${match.currency}
+
+点击下方按钮立即参与比分预测。`;
+  }
+
+  return `⏰ Match Reminder
+
+${formatTeamWithFlag(match.team_a)} vs ${formatTeamWithFlag(match.team_b)} kicks off in about 1 hour.
+
+Prediction is open now and voting closes 15 minutes before kick-off.
+Minimum vote: ${formatAmount(minBet)} ${match.currency}
+
+Tap below to submit your exact-score prediction.`;
+}
+
+function getMatchReminderKeyboard(match, ctxOrLang = null) {
+  const buttonText = isZh(ctxOrLang) ? "🗳 立即投票" : "🗳 Vote Now";
+  const url = getBetNowUrl(match.match_code);
+
+  if (url) {
+    return Markup.inlineKeyboard([[Markup.button.url(buttonText, url)]]);
+  }
+
+  return Markup.inlineKeyboard([[Markup.button.callback(buttonText, `wcmatch:${match.match_code}`)]]);
+}
+
+async function getOneHourReminderRecipients() {
+  const recipients = new Map();
+
+  function addRecipient(row, source = "unknown") {
+    const telegramId = getTelegramIdValue(row);
+    if (!telegramId) return;
+
+    const key = String(telegramId);
+    const existing = recipients.get(key) || {};
+    const preferredLang = row?.preferred_lang || existing.preferred_lang || "en";
+
+    recipients.set(key, {
+      telegram_id: telegramId,
+      preferred_lang: normalizeLangValue(preferredLang),
+      username: row?.username || existing.username || null,
+      first_name: row?.first_name || existing.first_name || null,
+      last_name: row?.last_name || existing.last_name || null,
+      source: existing.source ? `${existing.source},${source}` : source
+    });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("wc_bot_users")
+      .select("telegram_id, preferred_lang, username, first_name, last_name")
+      .limit(MATCH_REMINDER_BATCH_SIZE);
+
+    if (error) {
+      console.error("Load wc_bot_users for reminders error:", error.message);
+    } else {
+      for (const row of data || []) addRecipient(row, "bot_users");
+    }
+  } catch (error) {
+    console.error("Load wc_bot_users for reminders exception:", error.message);
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("wc_users")
+      .select("telegram_id, username, first_name, last_name")
+      .limit(MATCH_REMINDER_BATCH_SIZE);
+
+    if (error) {
+      console.error("Load wc_users for reminders error:", error.message);
+    } else {
+      for (const row of data || []) addRecipient(row, "wc_users");
+    }
+  } catch (error) {
+    console.error("Load wc_users for reminders exception:", error.message);
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("wc_orders")
+      .select("telegram_id, username, first_name, last_name")
+      .limit(Math.max(MATCH_REMINDER_BATCH_SIZE, 5000));
+
+    if (error) {
+      console.error("Load wc_orders for reminders error:", error.message);
+    } else {
+      for (const row of data || []) addRecipient(row, "wc_orders");
+    }
+  } catch (error) {
+    console.error("Load wc_orders for reminders exception:", error.message);
+  }
+
+  return Array.from(recipients.values());
+}
+
+async function claimReminderLog(matchCode, telegramId, reminderType, preferredLang) {
+  const payload = {
+    match_code: matchCode,
+    telegram_id: telegramId,
+    reminder_type: reminderType,
+    preferred_lang: normalizeLangValue(preferredLang),
+    status: "pending",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  const { error } = await supabase
+    .from("wc_reminder_logs")
+    .insert(payload);
+
+  if (!error) return true;
+
+  if (error.code === "23505" || String(error.message || "").toLowerCase().includes("duplicate")) {
+    return false;
+  }
+
+  throw new Error(`Failed to claim reminder log: ${error.message}`);
+}
+
+async function updateReminderLog(matchCode, telegramId, reminderType, patch) {
+  const { error } = await supabase
+    .from("wc_reminder_logs")
+    .update({
+      ...patch,
+      updated_at: new Date().toISOString()
+    })
+    .eq("match_code", matchCode)
+    .eq("telegram_id", telegramId)
+    .eq("reminder_type", reminderType);
+
+  if (error) {
+    console.error("Update reminder log error:", error.message);
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendReminderToRecipient(match, recipient, reminderType = "one_hour") {
+  const lang = normalizeLangValue(recipient.preferred_lang || "en");
+  const telegramId = recipient.telegram_id;
+  const claimed = await claimReminderLog(match.match_code, telegramId, reminderType, lang);
+
+  if (!claimed) {
+    return { status: "skipped_duplicate" };
+  }
+
+  try {
+    await bot.telegram.sendMessage(
+      telegramId,
+      buildMatchReminderMessage(match, lang),
+      getMatchReminderKeyboard(match, lang)
+    );
+
+    await updateReminderLog(match.match_code, telegramId, reminderType, {
+      status: "sent",
+      sent_at: new Date().toISOString(),
+      error: null
+    });
+
+    return { status: "sent" };
+  } catch (error) {
+    await updateReminderLog(match.match_code, telegramId, reminderType, {
+      status: "failed",
+      error: String(error.message || error).slice(0, 500)
+    });
+
+    return { status: "failed", error: error.message };
+  }
+}
+
+async function getDueReminderMatches(now = new Date()) {
+  const matches = await getAllOpenMatches();
+  return matches.filter((match) => isMatchDueForOneHourReminder(match, now));
+}
+
+async function runOneHourMatchReminderCheck(source = "interval") {
+  if (!ONE_HOUR_REMINDER_ENABLED) {
+    return { source, enabled: false, due_matches: 0, recipients: 0, sent: 0, skipped: 0, failed: 0 };
+  }
+
+  const now = new Date();
+  const dueMatches = await getDueReminderMatches(now);
+
+  if (!dueMatches.length) {
+    return { source, enabled: true, due_matches: 0, recipients: 0, sent: 0, skipped: 0, failed: 0 };
+  }
+
+  const recipients = await getOneHourReminderRecipients();
+  let sent = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  for (const match of dueMatches) {
+    for (const recipient of recipients) {
+      const result = await sendReminderToRecipient(match, recipient, "one_hour");
+
+      if (result.status === "sent") sent += 1;
+      else if (result.status === "failed") failed += 1;
+      else skipped += 1;
+
+      if (MATCH_REMINDER_SEND_DELAY_MS > 0) {
+        await delay(MATCH_REMINDER_SEND_DELAY_MS);
+      }
+    }
+  }
+
+  return {
+    source,
+    enabled: true,
+    due_matches: dueMatches.length,
+    match_codes: dueMatches.map((match) => match.match_code),
+    recipients: recipients.length,
+    sent,
+    skipped,
+    failed
+  };
+}
+
+async function runRemindersCommand(ctx) {
+  if (!(await requireAdminControlChat(ctx))) return;
+
+  try {
+    const result = await runOneHourMatchReminderCheck("admin_command");
+    return ctx.reply(`✅ Reminder check completed.
+
+Due matches: ${result.due_matches}
+Recipients: ${result.recipients}
+Sent: ${result.sent}
+Skipped: ${result.skipped}
+Failed: ${result.failed}${result.match_codes?.length ? `
+Matches: ${result.match_codes.join(", ")}` : ""}`);
+  } catch (error) {
+    console.error("Reminder command error:", error);
+    return ctx.reply(`Reminder check failed: ${error.message}`);
+  }
+}
+
+async function reminderTestCommand(ctx, text) {
+  if (!(await requireAdminControlChat(ctx))) return;
+
+  const cleaned = cleanCommandText(text);
+  const match = cleaned.match(/^\/reminder_test_(WC[A-Z0-9]+)$/i);
+
+  if (!match) {
+    return ctx.reply("Invalid format. Example: /reminder_test_WC0001");
+  }
+
+  const matchData = await getMatch(match[1].toUpperCase());
+  if (!matchData) return ctx.reply("Match not found.");
+
+  const lang = getUserLang(ctx);
+  await ctx.reply(buildMatchReminderMessage(matchData, lang), getMatchReminderKeyboard(matchData, lang));
+  return ctx.reply("✅ Reminder preview sent above. This test does not write reminder logs.");
+}
+
+function startMatchReminderChecker() {
+  if (!ONE_HOUR_REMINDER_ENABLED) return;
+  if (!MATCH_REMINDER_CHECK_INTERVAL_MS || MATCH_REMINDER_CHECK_INTERVAL_MS < 30000) return;
+
+  setInterval(async () => {
+    try {
+      const result = await runOneHourMatchReminderCheck("interval");
+      if (result.sent || result.failed) {
+        console.log("One-hour reminder check:", result);
+      }
+    } catch (error) {
+      console.error("One-hour reminder checker error:", error.message);
+    }
+  }, MATCH_REMINDER_CHECK_INTERVAL_MS);
 }
 
 async function createMatch(ctx, text) {
@@ -5451,6 +5836,8 @@ Admin:
 /need_result - View matches whose voting is closed but result is not recorded
 /need_result_2026.06.14 - View result-pending matches on a date
 /no_bet_WC0001 - Close a voting-closed match with no confirmed orders, without publishing result or carryover
+/reminders - Manually run one-hour match reminder check
+/reminder_test_WC0001 - Preview one-hour reminder message for a match
 /send_topic_rules - Send official pinned activity rules to World Cup topic with Start Prediction button
 /chatid - Check chat ID and topic ID
 /ping - Test bot`;
@@ -5469,6 +5856,10 @@ Use the menu below to continue.`;
 bot.start(async (ctx) => {
   const text = getMessageText(ctx);
   const payload = text.split(/\s+/)[1] || "";
+
+  if (isPrivateChat(ctx)) {
+    await upsertBotUser(ctx);
+  }
 
   if (payload.startsWith("vote_") || payload.startsWith("bet_")) {
     const matchCode = payload.replace(/^(vote_|bet_)/i, "").toUpperCase();
@@ -5593,6 +5984,10 @@ bot.on("callback_query", async (ctx) => {
   try {
     const data = ctx.callbackQuery?.data || "";
 
+    if (isPrivateChat(ctx)) {
+      await upsertBotUser(ctx);
+    }
+
     if (data.startsWith("wcmyvote:")) {
       if (!isPrivateChat(ctx)) {
         return ctx.answerCbQuery("Please use private chat with the bot.", { show_alert: true });
@@ -5619,6 +6014,7 @@ bot.on("callback_query", async (ctx) => {
 
       const lang = data.split(":")[1] === "zh" ? "zh" : "en";
       setUserLang(ctx, lang);
+      await saveUserLanguage(ctx, lang);
       acceptedRulesStore.delete(String(ctx.from.id));
 
       const session = getSession(ctx);
@@ -5843,6 +6239,10 @@ bot.on("message", async (ctx) => {
   try {
     if (!ctx.from || ctx.from.is_bot) return;
 
+    if (isPrivateChat(ctx)) {
+      await upsertBotUser(ctx);
+    }
+
     const text = getMessageText(ctx);
     if (!text) return;
 
@@ -5953,6 +6353,14 @@ bot.on("message", async (ctx) => {
     if (/^\/need_result(?:_(\d{4}\.\d{2}\.\d{2}))?$/i.test(cleaned)) {
       const needResultMatch = cleaned.match(/^\/need_result(?:_(\d{4}\.\d{2}\.\d{2}))?$/i);
       return showMatchesNeedingResult(ctx, needResultMatch?.[1] || "");
+    }
+
+    if (/^\/reminders$/i.test(cleaned)) {
+      return runRemindersCommand(ctx);
+    }
+
+    if (/^\/reminder_test_/i.test(cleaned)) {
+      return reminderTestCommand(ctx, cleaned);
     }
 
     if (/^\/pending(?:_(WC[A-Z0-9]+))?$/i.test(cleaned)) {
@@ -6142,6 +6550,23 @@ app.post("/telegram", async (req, res) => {
   }
 });
 
+app.get("/cron/reminders", async (req, res) => {
+  try {
+    if (CRON_SECRET) {
+      const provided = String(req.query.key || req.headers["x-cron-secret"] || "");
+      if (provided !== CRON_SECRET) {
+        return res.status(401).json({ ok: false, error: "Unauthorized" });
+      }
+    }
+
+    const result = await runOneHourMatchReminderCheck("cron");
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    console.error("Cron reminders error:", error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get("/", (req, res) => {
   res.send("UEEx World Cup Bot is running.");
 });
@@ -6167,7 +6592,9 @@ app.listen(PORT, async () => {
 
     startLiveMatchUpdater();
     startAutoPaymentChecker();
+    startMatchReminderChecker();
     console.log(`Live match updater interval: ${LIVE_UPDATE_INTERVAL_MS} ms`);
+    console.log(`One-hour reminders enabled: ${ONE_HOUR_REMINDER_ENABLED ? "ON" : "OFF"}; interval: ${MATCH_REMINDER_CHECK_INTERVAL_MS} ms; window: ${MATCH_REMINDER_EARLIEST_MINUTES_BEFORE_KICKOFF}-${MATCH_REMINDER_LATEST_MINUTES_BEFORE_KICKOFF} minutes before kickoff`);
     console.log(`Auto confirmation enabled: ${AUTO_CONFIRM_ENABLED ? "ON" : "OFF"}; interval: ${PAYMENT_CHECK_INTERVAL_MS} ms; item_id: ${UEEX_PAYMENT_ITEM_ID}; payment_type: ${UEEX_PAYMENT_TYPE}; receiver_uid: ${UEEX_RECEIVER_UID}; uid_match_mode: ${UEEX_UID_MATCH_MODE}; internal_exchange_type: ${UEEX_INTERNAL_EXCHANGE_TYPE}; success_status: ${UEEX_SUCCESS_STATUS}; api_base: ${UEEX_API_BASE_URL || "not set"}; path: ${UEEX_API_DEPOSIT_LIST_PATH}`);
   } catch (error) {
     console.error("Startup error:", error);
